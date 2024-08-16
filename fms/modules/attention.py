@@ -14,8 +14,14 @@ from fms.distributed.tensorparallel import (
 )
 from fms.modules.positions import PositionEncoder
 from fms.modules.tp import TPModule
+from fms.triton.triton_linear import TritonLinear
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+import functools
 
+USE_CUDA = False
+USE_TRITON = True
 
+# flex_attention = torch.compile(flex_attention, dynamic=False)
 class QKV(nn.Module, metaclass=abc.ABCMeta):
     """Simple module for applying qkv in attention"""
 
@@ -162,11 +168,21 @@ class FusedQKV(QKV):
             self.kvheads * self.emb_v_per_head,
         ]
 
-        self.qkv_fused = nn.Linear(
-            self.emb_dim,
-            sum(self.splits),
-            bias=self.use_bias,
-        )
+        if USE_CUDA:
+            self.qkv_fused = nn.Linear(
+                self.emb_dim,
+                sum(self.splits),
+                bias=self.use_bias,
+            )
+        
+        if USE_TRITON:
+            self.qkv_fused = TritonLinear(
+                self.emb_dim,
+                sum(self.splits),
+                bias=self.use_bias,
+            )
+
+
 
     def unfuse_weights(self):
         result = UnfusedQKV(
@@ -204,6 +220,13 @@ class FusedQKV(QKV):
             raise ValueError("q, k, and v must be the same or k and v must be None")
         return self.qkv_fused(qkv).split(self.splits, dim=-1)
 
+
+def causal_mask_prefill(b, h, q_idx, kv_idx):
+    return q_idx >= kv_idx
+
+def causal_mask_decode(self, b, h, q_idx, kv_idx):
+    offset = self.kv_len - self.q_len
+    return offset + q_idx >= kv_idx
 
 class MultiHeadAttention(nn.Module):
     """
@@ -248,7 +271,7 @@ class MultiHeadAttention(nn.Module):
         self.p_dropout = p_dropout if p_dropout is not None else 0.0
         self.use_bias = use_bias
         self.fused = fused
-
+        self.input_pos = 35
         self.in_proj: QKV = (FusedQKV if self.fused else UnfusedQKV)(
             self.emb_dim,
             self.nheads,
@@ -257,10 +280,17 @@ class MultiHeadAttention(nn.Module):
             self.emb_v_per_head,
             self.use_bias,
         )
-
-        self.dense = nn.Linear(
-            self.nheads * self.emb_v_per_head, self.emb_dim, bias=use_bias
-        )
+    
+        if USE_CUDA:
+            self.dense = nn.Linear(
+                self.nheads * self.emb_v_per_head, self.emb_dim, bias=use_bias
+            )
+            
+        if USE_TRITON:
+            self.dense = TritonLinear(
+                self.nheads * self.emb_v_per_head, self.emb_dim, bias=use_bias
+            )
+        
         if self.p_dropout:
             self.attn_dropout = nn.Dropout(self.p_dropout)
         self.position_encoder = position_encoder
@@ -282,6 +312,7 @@ class MultiHeadAttention(nn.Module):
 
     def to_tp(self, group: ProcessGroup) -> "TPMultiHeadAttention":
         return TPMultiHeadAttention.import_module(self, group)
+    
 
     def forward(
         self,
@@ -317,6 +348,7 @@ class MultiHeadAttention(nn.Module):
         # q, k, v: batch_size x seq_len x emb_dim
         # mask: batch_size x seq_len x seq_len
         batch_size, q_len, _ = q.size()
+
 
         # if this is self attention, we always recompute
         # cross attention only gets computed when a cache does not exist
@@ -383,6 +415,9 @@ class MultiHeadAttention(nn.Module):
             keys_e = keys
             values_e = values
 
+        self.kv_len = keys_e.size(2)
+        self.q_len = queries.size(2)
+
         if attn_algorithm:
             # Pick which fused attn kernels will run.
             use_flash = attn_algorithm == "flash"
@@ -393,14 +428,32 @@ class MultiHeadAttention(nn.Module):
             torch.backends.cuda.enable_mem_efficient_sdp(use_mem_efficient)
             torch.backends.cuda.enable_math_sdp(use_math)
 
-        attn = F.scaled_dot_product_attention(
-            queries,
-            keys_e,
-            values_e,
-            attn_mask=attn_mask,
-            dropout_p=self.p_dropout if self.training else 0.0,
-            is_causal=is_causal_mask,
-        )
+        if USE_CUDA:
+
+            attn = F.scaled_dot_product_attention(
+                queries,
+                keys_e,
+                values_e,
+                attn_mask=attn_mask,
+                dropout_p=self.p_dropout if self.training else 0.0,
+                is_causal=is_causal_mask,
+            )
+
+        if USE_TRITON:
+            
+            bs, nh, seq_len, hd = queries.shape
+            if seq_len > 1:
+
+                block_mask = create_block_mask(causal_mask_prefill, bs, nh, seq_len, seq_len)
+                attention = functools.partial(flex_attention, block_mask=block_mask, enable_gqa=True)
+                attn = attention(queries, keys_e, values_e)
+
+            else:
+                _, _, kv_len, _ = keys_e.shape
+                block_mask = create_block_mask(lambda a, b, c, d: causal_mask_decode(self, a, b, c, d), bs, nh, seq_len, kv_len)
+                attention = functools.partial(flex_attention, block_mask=block_mask, enable_gqa=True)
+                attn = attention(queries, keys_e, values_e)
+
 
         if attn_algorithm:
             torch.backends.cuda.enable_flash_sdp(self.previous_flash)

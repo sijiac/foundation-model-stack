@@ -13,7 +13,10 @@ from fms.distributed.tensorparallel import (
     copy_to_tensor_model_parallel_region,
 )
 from fms.modules.tp import TPModule
+from fms.triton.triton_linear import TritonLinear
 
+USE_CUDA = False
+USE_TRITON = True
 
 class WordEmbedding(nn.Module):
     """
@@ -78,7 +81,12 @@ class WordEmbedding(nn.Module):
             self.pos_emb = nn.Embedding(max_pos, self.emb_dim)
             self.register_buffer("pos_id", torch.arange(max_pos).unsqueeze(0))
         if reversible:
-            self.head = nn.Linear(self.emb_dim, self.vocab_size, bias=bias)
+
+            if USE_CUDA:
+                self.head = nn.Linear(self.emb_dim, self.vocab_size, bias=bias)
+            if USE_TRITON:
+                self.head = TritonLinear(self.emb_dim, self.vocab_size, bias=bias)
+    
             if tie_weights:
                 self.head.weight = self.emb.weight
 

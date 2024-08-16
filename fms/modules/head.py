@@ -11,7 +11,10 @@ from fms.distributed.tensorparallel import (
     copy_to_tensor_model_parallel_region,
 )
 from fms.modules.tp import TPModule
+from fms.triton.triton_linear import TritonLinear
 
+USE_CUDA = False
+USE_TRITON = True
 
 class MLPClassificationHead(nn.Module):
     """
@@ -55,11 +58,18 @@ class MLPClassificationHead(nn.Module):
             use the entire sequence as input to the dense layer
         """
         super().__init__()
-        self.dense = nn.Linear(emb_dim, emb_dim, bias=dense_bias)
+        if USE_CUDA:
+            self.dense = nn.Linear(emb_dim, emb_dim, bias=dense_bias)
+        if USE_TRITON:
+            self.dense = TritonLinear(emb_dim, emb_dim, bias=dense_bias)
+
         self.act = activation_fn
         self.dropout = nn.Dropout(dropout)
         self.ln = layer_norm
-        self.head = nn.Linear(emb_dim, num_classes, bias=head_bias)
+        if USE_CUDA:
+            self.head = nn.Linear(emb_dim, num_classes, bias=head_bias)
+        if USE_TRITON: 
+            self.head = TritonLinear(emb_dim, num_classes, bias=head_bias)
         self.apply_pooling_fn = apply_pooling_fn
 
     def forward(self, x: torch.Tensor):
