@@ -15,7 +15,7 @@ from fms.distributed.tensorparallel import (
 from fms.modules.positions import PositionEncoder
 from fms.modules.tp import TPModule
 from fms.triton.triton_linear import TritonLinear
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+from fms.triton.triton_flash_attention import flash as flash_amd_triton_kernel
 import functools
 
 USE_CUDA = False
@@ -441,19 +441,7 @@ class MultiHeadAttention(nn.Module):
 
         if USE_TRITON:
             
-            bs, nh, seq_len, hd = queries.shape
-            if seq_len > 1:
-
-                block_mask = create_block_mask(causal_mask_prefill, bs, nh, seq_len, seq_len)
-                attention = functools.partial(flex_attention, block_mask=block_mask, enable_gqa=True)
-                attn = attention(queries, keys_e, values_e)
-
-            else:
-                _, _, kv_len, _ = keys_e.shape
-                block_mask = create_block_mask(lambda a, b, c, d: causal_mask_decode(self, a, b, c, d), bs, nh, seq_len, kv_len)
-                attention = functools.partial(flex_attention, block_mask=block_mask, enable_gqa=True)
-                attn = attention(queries, keys_e, values_e)
-
+            attn = flash_amd_triton_kernel(queries, keys_e, values_e)
 
         if attn_algorithm:
             torch.backends.cuda.enable_flash_sdp(self.previous_flash)
