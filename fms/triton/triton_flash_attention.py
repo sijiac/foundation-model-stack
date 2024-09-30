@@ -155,9 +155,18 @@ def load_fn(block_ptr, first, second, pad):
     return tensor
 
 @triton.jit
+def load_scale_fn(block_ptr, first, pad):
+    if True:
+        tensor = tl.load(block_ptr, boundary_check=(0,), padding_option=pad)
+    else:
+        tensor = tl.load(block_ptr)
+    return tensor
+
+@triton.jit
 def _attn_fwd_inner(
-    acc, l_i, m_i, q,
-    K_block_ptr, V_block_ptr,
+    acc, l_i, m_i, q, qs,
+    K_block_ptr, Ks_block_ptr, V_block_ptr,
+    vs,
     start_m,
     actual_seqlen_k,
     actual_seqlen_q,
@@ -181,13 +190,16 @@ def _attn_fwd_inner(
     MASK_STEPS: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     RETURN_ENCODED_SOFTMAX: tl.constexpr,
-    PADDED_HEAD: tl.constexpr
+    PADDED_HEAD: tl.constexpr,
+    MAX_FP8: tl.constexpr,
 ):
     # loop over k, v, and update accumulator
     for start_n in range (block_min, block_max, BLOCK_N):
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
         k = load_fn(K_block_ptr, PADDED_HEAD, MASK_STEPS and (n_extra_tokens != 0), "zero")
+        ks = load_scale_fn(Ks_block_ptr, MASK_STEPS and (n_extra_tokens != 0), "zero")
+        ks = tl.where(ks < 1e-6, 1.0, ks)
         if PRE_LOAD_V:
             v = load_fn(V_block_ptr, MASK_STEPS and (n_extra_tokens != 0), PADDED_HEAD, "zero")
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -210,7 +222,16 @@ def _attn_fwd_inner(
             causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
             qk = tl.where(causal_mask, qk, float("-inf"))
         # -- compute qk ----
+        # breakpoint()
+        # qk_scale = tl.where(qk_scale < 1e-4, 1.0, qk_scale)
+        # qk_scale = tl.where(qk_scale >= 1.0 + 1e-4, 1.0, qk_scale)
+
+        # tl.device_print("qk_scale", qk_scale)
+        # qk_scale = tl.full([BLOCK_M, BLOCK_N], 1.0, dtype=tl.float32)
         qk += tl.dot(q, k)
+        qk_scale = qs[:, None] * ks[None, :]
+        qk *= qk_scale
+        # tl.device_print("qk_scale", qk_scale)
         if bias_ptr is not None:
             bias = load_fn(bias_ptr, False, MASK_STEPS and (n_extra_tokens != 0), "zero")
             # While bias is added after multiplying qk with sm_scale,
@@ -237,6 +258,13 @@ def _attn_fwd_inner(
         qk = qk - m_ij[:, None]
         p = tl.math.exp2(qk)
 
+        # p_max = tl.max(tl.abs(p))
+        # p_scale = p_max / MAX_FP8
+        # p_invs_scale = 1.0 / p_scale
+        # # p_fp8 = (p * p_invs_scale)
+        p_fp8 = p
+
+
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
         if ENABLE_DROPOUT:
@@ -256,9 +284,11 @@ def _attn_fwd_inner(
         l_i = l_i * alpha + l_ij
         # update m_i and l_i
         m_i = m_ij
-        acc += tl.dot(p.to(V_block_ptr.type.element_ty), v)
+        acc += tl.dot(p_fp8.to(V_block_ptr.type.element_ty), v) * vs
+        # acc += tl.dot(p_fp8.to(V_block_ptr.type.element_ty), v) * p_scale * vs
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+        Ks_block_ptr = tl.advance(Ks_block_ptr, (BLOCK_N,))
         if bias_ptr is not None:
             bias_ptr = tl.advance(bias_ptr, (0, BLOCK_N))
         if RETURN_ENCODED_SOFTMAX:
@@ -268,10 +298,13 @@ def _attn_fwd_inner(
 
 @triton.jit
 def attn_fwd(
-    Q, K, V, bias, sm_scale, L, Out,
+    Q, K, V, Qs, Ks, Vs, bias, sm_scale, L, Out,
     stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_qsz, stride_qsh, stride_qsm,
     stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_ksz, stride_ksh, stride_ksn,
     stride_vz, stride_vh, stride_vk, stride_vn,
+    # stride_vsz, stride_vsh, stride_vsk,
     stride_oz, stride_oh, stride_om, stride_on,
     stride_bz, stride_bh, stride_bm, stride_bn,
     stride_az, stride_ah,
@@ -290,6 +323,7 @@ def attn_fwd(
     RETURN_ENCODED_SOFTMAX: tl.constexpr,
     USE_ALIBI: tl.constexpr,
     BATCH_SIZE: tl.constexpr,
+    MAX_FP8: tl.constexpr,
 ):
     start_m = tl.program_id(0)
     off_h_q = tl.program_id(1)
@@ -378,6 +412,15 @@ def attn_fwd(
         block_shape=(BLOCK_M, BLOCK_DMODEL),
         order=(1, 0)
     )
+    qs_offset = off_z * stride_qsz +  off_h_q * stride_qsh + cu_seqlens_q_start * stride_qsm
+    Qs_block_ptr = tl.make_block_ptr(
+        base=Qs + qs_offset,
+        shape=(seqlen_q,),
+        strides=(stride_qsm,),
+        offsets=(start_m * BLOCK_M,),
+        block_shape=(BLOCK_M,),
+        order=(0,)
+    )
     k_offset = off_z * stride_kz + off_h_k * stride_kh + cu_seqlens_k_start * stride_kn
     K_block_ptr = tl.make_block_ptr(
         base=K + k_offset,
@@ -387,6 +430,16 @@ def attn_fwd(
         block_shape=(BLOCK_DMODEL, BLOCK_N),
         order=(0, 1)
     )
+    ks_offset = off_z * stride_ksz +  off_h_k * stride_ksh + cu_seqlens_k_start * stride_ksn
+    Ks_block_ptr = tl.make_block_ptr(
+        base=Ks + ks_offset,
+        shape=(seqlen_k,),
+        strides=(stride_ksn,),
+        offsets=(0,),
+        block_shape=(BLOCK_N,),
+        order=(0,)
+    )
+    v_order: tl.constexpr = (0, 1) if V.dtype.element_ty == tl.float8e4nv else (1, 0)
     v_offset = off_z * stride_vz + off_h_k * stride_vh + cu_seqlens_k_start * stride_vk
     V_block_ptr = tl.make_block_ptr(
         base=V + v_offset,
@@ -394,8 +447,9 @@ def attn_fwd(
         strides=(stride_vk, stride_vn),
         offsets=(0, 0),
         block_shape=(BLOCK_N, BLOCK_DMODEL),
-        order=(1, 0)
+        order=v_order,
     )
+    vs = tl.load(Vs)
     if BIAS_TYPE != 0:
         b_offset = off_h_q * stride_bh # Note: this might get large enough to overflow on some configs
         bias_ptr = tl.make_block_ptr(
@@ -442,6 +496,16 @@ def attn_fwd(
     qk_scale = sm_scale * 1.44269504089
     # Q is loaded once at the beginning and shared by all N blocks.
     q = load_fn(Q_block_ptr, True, padded_head, "zero")
+    qs = load_scale_fn(Qs_block_ptr, True, "zero")
+    qs = tl.where(qs < 1e-6, 1.0, qs)
+
+    # start_m = tl.program_id(0)
+    # off_h_q = tl.program_id(1)
+    # off_z = tl.program_id(2)
+    # if start_m == 0 and off_h_q == 0 and off_z == 0:
+    # tl.device_print("qs", qs)
+
+    # qs = tl.where(tl.arange(0, BLOCK_M) < seqlen_q - BLOCK_M * , qs, 1.0)
     q = (q * qk_scale).to(Q_block_ptr.type.element_ty)
 
     # Here we compute how many full and masked blocks we have.
@@ -465,7 +529,7 @@ def attn_fwd(
     if n_full_blocks > 0:
         block_max = (n_blocks - masked_blocks) * BLOCK_N
         acc, l_i, m_i = _attn_fwd_inner(
-            acc, l_i, m_i, q, K_block_ptr, V_block_ptr,
+            acc, l_i, m_i, q, qs, K_block_ptr, Ks_block_ptr, V_block_ptr, vs,
             start_m, seqlen_k, seqlen_q,
             dropout_p, philox_seed, batch_philox_offset, encoded_softmax_block_ptr,
             # _, _, offs_n_causal, masked_blocks, n_extra_tokens, _
@@ -473,7 +537,7 @@ def attn_fwd(
             # IS_CAUSAL, ....
             False, BLOCK_M, BLOCK_DMODEL, BLOCK_N, offs_m, offs_n,
             # _, MASK_STEPS, ...
-            PRE_LOAD_V, False, ENABLE_DROPOUT, RETURN_ENCODED_SOFTMAX, padded_head
+            PRE_LOAD_V, False, ENABLE_DROPOUT, RETURN_ENCODED_SOFTMAX, padded_head, MAX_FP8
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -486,6 +550,7 @@ def attn_fwd(
         else:
             offs_n_causal = 0
         K_block_ptr = tl.advance(K_block_ptr, (0, n_full_blocks*BLOCK_N))
+        Ks_block_ptr = tl.advance(Ks_block_ptr, (n_full_blocks*BLOCK_N,))
         V_block_ptr = tl.advance(V_block_ptr, (n_full_blocks*BLOCK_N, 0))
         if bias_ptr is not None:
             bias_ptr = tl.advance(bias_ptr, (0, n_full_blocks*BLOCK_N))
@@ -493,13 +558,13 @@ def attn_fwd(
             encoded_softmax_block_ptr = tl.advance(encoded_softmax_block_ptr,
                                                    (0, n_full_blocks))
         acc, l_i, m_i = _attn_fwd_inner(
-            acc, l_i, m_i, q, K_block_ptr, V_block_ptr,
+            acc, l_i, m_i, q, qs, K_block_ptr, Ks_block_ptr, V_block_ptr, vs,
             start_m, seqlen_k, seqlen_q,
             dropout_p, philox_seed, batch_philox_offset, encoded_softmax_block_ptr,
             block_min, block_max, offs_n_causal, masked_blocks, n_extra_tokens, bias_ptr, alibi_slope,
             IS_CAUSAL, BLOCK_M, BLOCK_DMODEL, BLOCK_N, offs_m, offs_n,
             # _, MASK_STEPS, ...
-            PRE_LOAD_V, True, ENABLE_DROPOUT, RETURN_ENCODED_SOFTMAX, padded_head
+            PRE_LOAD_V, True, ENABLE_DROPOUT, RETURN_ENCODED_SOFTMAX, padded_head, MAX_FP8
         )
     # epilogue
     acc = acc / l_i[:, None]
@@ -550,91 +615,102 @@ def attn_fwd(
 
 
 
-def attention(q, k, v, sm_scale):
+# def attention(q, k, v, sm_scale):
 
-    o = torch.empty_like(q, dtype=v.dtype)
+#     o = torch.empty_like(q, dtype=v.dtype)
 
-    batch, nheads_q, seqlen_q, head_size = q.shape
-    _, nheads_k, seqlen_k, _ = k.shape
+#     batch, nheads_q, seqlen_q, head_size = q.shape
+#     _, nheads_k, seqlen_k, _ = k.shape
 
-    max_seqlens_q = seqlen_q
+#     max_seqlens_q = seqlen_q
 
-    q_strides = (q.stride(0), q.stride(1), q.stride(2), q.stride(3))
-    k_strides = (k.stride(0), k.stride(1), k.stride(2), k.stride(3))
-    v_strides = (v.stride(0), v.stride(1), v.stride(2), v.stride(3))
-    o_strides = (o.stride(0), o.stride(1), o.stride(2), o.stride(3))
+#     q_strides = (q.stride(0), q.stride(1), q.stride(2), q.stride(3))
+#     k_strides = (k.stride(0), k.stride(1), k.stride(2), k.stride(3))
+#     v_strides = (v.stride(0), v.stride(1), v.stride(2), v.stride(3))
+#     o_strides = (o.stride(0), o.stride(1), o.stride(2), o.stride(3))
 
-    # Get closest power of 2 over or equal to 32.
-    unpadded_head_dims = {32, 64, 128, 256}
-    if head_size not in unpadded_head_dims:
-        padded_d_model = None
-        for i in unpadded_head_dims:
-            if i > head_size:
-                padded_d_model = i
-                break
-        assert padded_d_model is not None
-    else:
-        padded_d_model = head_size
+#     # Get closest power of 2 over or equal to 32.
+#     unpadded_head_dims = {32, 64, 128, 256}
+#     if head_size not in unpadded_head_dims:
+#         padded_d_model = None
+#         for i in unpadded_head_dims:
+#             if i > head_size:
+#                 padded_d_model = i
+#                 break
+#         assert padded_d_model is not None
+#     else:
+#         padded_d_model = head_size
 
 
-    # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'PRE_LOAD_V': False}, num_stages=1, num_warps=4)
+#     # triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'PRE_LOAD_V': False}, num_stages=1, num_warps=4)
 
-    BLOCK_M = 128
-    BLOCK_N = 128
-    PRE_LOAD_V = False
-    num_stages = 1
-    num_warps = 4
+#     BLOCK_M = 128
+#     BLOCK_N = 128
+#     PRE_LOAD_V = False
+#     num_stages = 1
+#     num_warps = 4
 
-    grid = (triton.cdiv(max_seqlens_q, BLOCK_M), nheads_q, batch)
+#     grid = (triton.cdiv(max_seqlens_q, BLOCK_M), nheads_q, batch)
 
-    # encoded_softmax is used to validate dropout behavior vs the PyTorch SDPA math backend reference.  We zero this out
-    # to give a consistent starting point and then populate it with the output of softmax with the sign bit set according
-    # to the dropout mask. The resulting return allows this mask to be fed into the reference implementation for testing
-    # only.  This return holds no useful output aside from debugging.
+#     # encoded_softmax is used to validate dropout behavior vs the PyTorch SDPA math backend reference.  We zero this out
+#     # to give a consistent starting point and then populate it with the output of softmax with the sign bit set according
+#     # to the dropout mask. The resulting return allows this mask to be fed into the reference implementation for testing
+#     # only.  This return holds no useful output aside from debugging.
 
-    encoded_softmax = None
+#     encoded_softmax = None
 
-    M = torch.empty((batch, nheads_q, max_seqlens_q), device=q.device, dtype=torch.float32)
+#     M = torch.empty((batch, nheads_q, max_seqlens_q), device=q.device, dtype=torch.float32)
 
-    # Seed the RNG so we get reproducible results for testing.
-    philox_seed = 0x1BF52
-    philox_offset = 0x1D4B42
+#     # Seed the RNG so we get reproducible results for testing.
+#     philox_seed = 0x1BF52
+#     philox_offset = 0x1D4B42
     
-    bias_strides = (0,0,0,0)
-    alibi_strides = (0, 0)
+#     bias_strides = (0,0,0,0)
+#     alibi_strides = (0, 0)
     
-    attn_fwd[grid](
-        q, k, v, None, sm_scale, M, o,
-        *q_strides, *k_strides, *v_strides, *o_strides, *bias_strides, *alibi_strides,
-        None, None,
-        BLOCK_M=BLOCK_M,
-        PRE_LOAD_V=PRE_LOAD_V,
-        BLOCK_N=BLOCK_N,
-        dropout_p=0.0,
-        philox_seed=philox_seed,
-        philox_offset_base=philox_offset,
-        encoded_softmax=encoded_softmax,
-        hq=nheads_q, hk=nheads_k,
-        alibi_slopes = None,
-        ACTUAL_BLOCK_DMODEL=head_size,
-        MAX_SEQLENS_Q=seqlen_q, 
-        MAX_SEQLENS_K=seqlen_k,
-        IS_CAUSAL=False, ########################
-        VARLEN=False,
-        BLOCK_DMODEL=padded_d_model,
-        BIAS_TYPE=0,
-        USE_ALIBI=0,
-        ENABLE_DROPOUT=False,
-        RETURN_ENCODED_SOFTMAX=False,
-        BATCH_SIZE= q.shape[0],
-    )
-    return o
+#     max_fp8 = torch.finfo(torch.float8_e4m3fn).max
+
+#     attn_fwd[grid](
+#         q, k, v, None, sm_scale, M, o,
+#         *q_strides, *k_strides, *v_strides, *o_strides, *bias_strides, *alibi_strides,
+#         None, None,
+#         BLOCK_M=BLOCK_M,
+#         PRE_LOAD_V=PRE_LOAD_V,
+#         BLOCK_N=BLOCK_N,
+#         dropout_p=0.0,
+#         philox_seed=philox_seed,
+#         philox_offset_base=philox_offset,
+#         encoded_softmax=encoded_softmax,
+#         hq=nheads_q, hk=nheads_k,
+#         alibi_slopes = None,
+#         ACTUAL_BLOCK_DMODEL=head_size,
+#         MAX_SEQLENS_Q=seqlen_q, 
+#         MAX_SEQLENS_K=seqlen_k,
+#         IS_CAUSAL=False, ########################
+#         VARLEN=False,
+#         BLOCK_DMODEL=padded_d_model,
+#         BIAS_TYPE=0,
+#         USE_ALIBI=0,
+#         ENABLE_DROPOUT=False,
+#         RETURN_ENCODED_SOFTMAX=False,
+#         BATCH_SIZE= q.shape[0],
+#         MAX_FP8=max_fp8,
+#     )
+#     return o
 
 
 @torch.library.custom_op("triton::flash", mutates_args=())
-def flash(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def flash(
+    q: torch.Tensor, 
+    k: torch.Tensor, 
+    v: torch.Tensor,
+    qs: torch.Tensor, 
+    ks: torch.Tensor, 
+    vs: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
 
-    o = torch.empty_like(q, dtype=v.dtype)
+    o = torch.empty_like(q, dtype=output_dtype)
     sm_scale = q.shape[-1] ** -0.5
 
     batch, nheads_q, seqlen_q, head_size = q.shape
@@ -643,8 +719,11 @@ def flash(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     max_seqlens_q = seqlen_q
 
     q_strides = (q.stride(0), q.stride(1), q.stride(2), q.stride(3))
+    qs_strides = (qs.stride(0), qs.stride(1), qs.stride(2))
     k_strides = (k.stride(0), k.stride(1), k.stride(2), k.stride(3))
+    ks_strides = (ks.stride(0), ks.stride(1), ks.stride(2))
     v_strides = (v.stride(0), v.stride(1), v.stride(2), v.stride(3))
+    # vs_strides = (vs.stride(0), vs.stride(1), vs.stride(2))
     o_strides = (o.stride(0), o.stride(1), o.stride(2), o.stride(3))
 
     # Get closest power of 2 over or equal to 32.
@@ -680,10 +759,12 @@ def flash(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     
     bias_strides = (0,0,0,0)
     alibi_strides = (0, 0)
-    
+
+    max_fp8 = torch.finfo(torch.float8_e4m3fn).max
+
     attn_fwd[grid](
-        q, k, v, None, sm_scale, M, o,
-        *q_strides, *k_strides, *v_strides, *o_strides, *bias_strides, *alibi_strides,
+        q, k, v, qs, ks, vs, None, sm_scale, M, o,
+        *q_strides, *qs_strides, *k_strides, *ks_strides, *v_strides, *o_strides, *bias_strides, *alibi_strides,
         None, None,
         BLOCK_M=BLOCK_M,
         PRE_LOAD_V=PRE_LOAD_V,
@@ -705,6 +786,7 @@ def flash(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         ENABLE_DROPOUT=False,
         RETURN_ENCODED_SOFTMAX=False,
         BATCH_SIZE= q.shape[0],
+        MAX_FP8=max_fp8,
     )
     return o
 
@@ -728,4 +810,3 @@ if __name__ == "__main__":
         return flash(q, k, v)
     
     o = f(q, k, v)
-    print(o)
