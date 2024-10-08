@@ -9,6 +9,7 @@ from torch import distributed as dist
 
 from fms.models import get_model
 from fms.utils import evaluation, tokenizers
+from fms.utils.eval_perplexity import evaluate_perplexity
 
 
 """
@@ -141,15 +142,27 @@ if args.compile:
     model = torch.compile(model, mode=args.compile_mode)
 
 
-lm_obj = evaluation.FMSEvalHarnessLM(model=model, tokenizer=tokenizer, device=device)
 
-lm_eval.tasks.initialize_tasks()
+if args.tasks.split(",") == "perplexity":
+    evaluate_perplexity(model, tokenizer)
+else:
+    args.tasks = ",".join(lm_eval.tasks.TASKS.keys())
+    lm_obj = evaluation.FMSEvalHarnessLM(model=model, tokenizer=tokenizer, device=device)
+    # lm_ojb_hf = evaluation_hf.HFLM(pretrained=model, tokenizer=tokenizer, device=device, max_length=8192)
 
-results = lm_eval.simple_evaluate(
-    model=lm_obj,
-    tasks=args.tasks.split(","),
-    num_fewshot=args.num_fewshot,
-)
-print(make_table(results))
-if "groups" in results:
-    print(make_table(results, "groups"))
+    task_manager = lm_eval.tasks.TaskManager()
+
+    print(f"[Eval Harness] tasks = {args.tasks} num_fewshot = {args.num_fewshot}")
+
+    results = lm_eval.simple_evaluate(
+        model=lm_obj,
+        tasks=args.tasks.split(","),
+        num_fewshot=args.num_fewshot,
+        task_manager=task_manager,
+        batch_size=10,
+        # limit=30,
+        device=device,
+    )
+    print(make_table(results))
+    if "groups" in results:
+        print(make_table(results, "groups"))

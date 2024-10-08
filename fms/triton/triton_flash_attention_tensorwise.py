@@ -165,7 +165,7 @@ def load_scale_fn(block_ptr, first, pad):
 @triton.jit
 def _attn_fwd_inner(
     acc, l_i, m_i, q, qs,
-    K_block_ptr, Ks_block_ptr, V_block_ptr,
+    K_block_ptr, ks, V_block_ptr,
     vs,
     start_m,
     actual_seqlen_k,
@@ -198,8 +198,8 @@ def _attn_fwd_inner(
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
         k = load_fn(K_block_ptr, PADDED_HEAD, MASK_STEPS and (n_extra_tokens != 0), "zero")
-        ks = load_scale_fn(Ks_block_ptr, MASK_STEPS and (n_extra_tokens != 0), "zero")
-        ks = tl.where(ks < 1e-6, 1.0, ks)
+        # ks = load_scale_fn(Ks_block_ptr, MASK_STEPS and (n_extra_tokens != 0), "zero")
+        # ks = tl.where(ks < 1e-6, 1.0, ks)
         if PRE_LOAD_V:
             v = load_fn(V_block_ptr, MASK_STEPS and (n_extra_tokens != 0), PADDED_HEAD, "zero")
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -229,8 +229,7 @@ def _attn_fwd_inner(
         # tl.device_print("qk_scale", qk_scale)
         # qk_scale = tl.full([BLOCK_M, BLOCK_N], 1.0, dtype=tl.float32)
         qk += tl.dot(q, k)
-        qk_scale = qs[:, None] * ks[None, :]
-        qk *= qk_scale
+        qk *=  qs * ks
         # tl.device_print("qk_scale", qk_scale)
         if bias_ptr is not None:
             bias = load_fn(bias_ptr, False, MASK_STEPS and (n_extra_tokens != 0), "zero")
@@ -288,7 +287,7 @@ def _attn_fwd_inner(
         # acc += tl.dot(p_fp8.to(V_block_ptr.type.element_ty), v) * p_scale * vs
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-        Ks_block_ptr = tl.advance(Ks_block_ptr, (BLOCK_N,))
+        # Ks_block_ptr = tl.advance(Ks_block_ptr, (BLOCK_N,))
         if bias_ptr is not None:
             bias_ptr = tl.advance(bias_ptr, (0, BLOCK_N))
         if RETURN_ENCODED_SOFTMAX:
@@ -300,9 +299,9 @@ def _attn_fwd_inner(
 def attn_fwd(
     Q, K, V, Qs, Ks, Vs, bias, sm_scale, L, Out,
     stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_qsz, stride_qsh, stride_qsm,
+    # stride_qsz, stride_qsh, stride_qsm,
     stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_ksz, stride_ksh, stride_ksn,
+    # stride_ksz, stride_ksh, stride_ksn,
     stride_vz, stride_vh, stride_vk, stride_vn,
     # stride_vsz, stride_vsh, stride_vsk,
     stride_oz, stride_oh, stride_om, stride_on,
@@ -412,15 +411,15 @@ def attn_fwd(
         block_shape=(BLOCK_M, BLOCK_DMODEL),
         order=(1, 0)
     )
-    qs_offset = off_z * stride_qsz +  off_h_q * stride_qsh + cu_seqlens_q_start * stride_qsm
-    Qs_block_ptr = tl.make_block_ptr(
-        base=Qs + qs_offset,
-        shape=(seqlen_q,),
-        strides=(stride_qsm,),
-        offsets=(start_m * BLOCK_M,),
-        block_shape=(BLOCK_M,),
-        order=(0,)
-    )
+    # qs_offset = off_z * stride_qsz +  off_h_q * stride_qsh + cu_seqlens_q_start * stride_qsm
+    # Qs_block_ptr = tl.make_block_ptr(
+    #     base=Qs + qs_offset,
+    #     shape=(seqlen_q,),
+    #     strides=(stride_qsm,),
+    #     offsets=(start_m * BLOCK_M,),
+    #     block_shape=(BLOCK_M,),
+    #     order=(0,)
+    # )
     k_offset = off_z * stride_kz + off_h_k * stride_kh + cu_seqlens_k_start * stride_kn
     K_block_ptr = tl.make_block_ptr(
         base=K + k_offset,
@@ -430,15 +429,15 @@ def attn_fwd(
         block_shape=(BLOCK_DMODEL, BLOCK_N),
         order=(0, 1)
     )
-    ks_offset = off_z * stride_ksz +  off_h_k * stride_ksh + cu_seqlens_k_start * stride_ksn
-    Ks_block_ptr = tl.make_block_ptr(
-        base=Ks + ks_offset,
-        shape=(seqlen_k,),
-        strides=(stride_ksn,),
-        offsets=(0,),
-        block_shape=(BLOCK_N,),
-        order=(0,)
-    )
+    # ks_offset = off_z * stride_ksz +  off_h_k * stride_ksh + cu_seqlens_k_start * stride_ksn
+    # Ks_block_ptr = tl.make_block_ptr(
+    #     base=Ks + ks_offset,
+    #     shape=(seqlen_k,),
+    #     strides=(stride_ksn,),
+    #     offsets=(0,),
+    #     block_shape=(BLOCK_N,),
+    #     order=(0,)
+    # )
     v_order: tl.constexpr = (0, 1) if V.dtype.element_ty == tl.float8e4nv else (1, 0)
     v_offset = off_z * stride_vz + off_h_k * stride_vh + cu_seqlens_k_start * stride_vk
     V_block_ptr = tl.make_block_ptr(
@@ -449,6 +448,8 @@ def attn_fwd(
         block_shape=(BLOCK_N, BLOCK_DMODEL),
         order=v_order,
     )
+    qs = tl.load(Qs)
+    ks = tl.load(Ks)
     vs = tl.load(Vs)
     if BIAS_TYPE != 0:
         b_offset = off_h_q * stride_bh # Note: this might get large enough to overflow on some configs
@@ -496,8 +497,6 @@ def attn_fwd(
     qk_scale = sm_scale * 1.44269504089
     # Q is loaded once at the beginning and shared by all N blocks.
     q = load_fn(Q_block_ptr, True, padded_head, "zero")
-    qs = load_scale_fn(Qs_block_ptr, True, "zero")
-    qs = tl.where(qs < 1e-6, 1.0, qs)
 
     # start_m = tl.program_id(0)
     # off_h_q = tl.program_id(1)
@@ -529,7 +528,7 @@ def attn_fwd(
     if n_full_blocks > 0:
         block_max = (n_blocks - masked_blocks) * BLOCK_N
         acc, l_i, m_i = _attn_fwd_inner(
-            acc, l_i, m_i, q, qs, K_block_ptr, Ks_block_ptr, V_block_ptr, vs,
+            acc, l_i, m_i, q, qs, K_block_ptr, ks, V_block_ptr, vs,
             start_m, seqlen_k, seqlen_q,
             dropout_p, philox_seed, batch_philox_offset, encoded_softmax_block_ptr,
             # _, _, offs_n_causal, masked_blocks, n_extra_tokens, _
@@ -550,7 +549,7 @@ def attn_fwd(
         else:
             offs_n_causal = 0
         K_block_ptr = tl.advance(K_block_ptr, (0, n_full_blocks*BLOCK_N))
-        Ks_block_ptr = tl.advance(Ks_block_ptr, (n_full_blocks*BLOCK_N,))
+        # Ks_block_ptr = tl.advance(Ks_block_ptr, (n_full_blocks*BLOCK_N,))
         V_block_ptr = tl.advance(V_block_ptr, (n_full_blocks*BLOCK_N, 0))
         if bias_ptr is not None:
             bias_ptr = tl.advance(bias_ptr, (0, n_full_blocks*BLOCK_N))
@@ -558,7 +557,7 @@ def attn_fwd(
             encoded_softmax_block_ptr = tl.advance(encoded_softmax_block_ptr,
                                                    (0, n_full_blocks))
         acc, l_i, m_i = _attn_fwd_inner(
-            acc, l_i, m_i, q, qs, K_block_ptr, Ks_block_ptr, V_block_ptr, vs,
+            acc, l_i, m_i, q, qs, K_block_ptr, ks, V_block_ptr, vs,
             start_m, seqlen_k, seqlen_q,
             dropout_p, philox_seed, batch_philox_offset, encoded_softmax_block_ptr,
             block_min, block_max, offs_n_causal, masked_blocks, n_extra_tokens, bias_ptr, alibi_slope,
@@ -699,7 +698,8 @@ def attn_fwd(
 #     return o
 
 
-def flash_QK_rowwise_V_tensorwise(
+@torch.library.custom_op("triton::flash", mutates_args=())
+def flash_QKV_tensorwise(
     q: torch.Tensor, 
     k: torch.Tensor, 
     v: torch.Tensor,
@@ -718,11 +718,8 @@ def flash_QK_rowwise_V_tensorwise(
     max_seqlens_q = seqlen_q
 
     q_strides = (q.stride(0), q.stride(1), q.stride(2), q.stride(3))
-    qs_strides = (qs.stride(0), qs.stride(1), qs.stride(2))
     k_strides = (k.stride(0), k.stride(1), k.stride(2), k.stride(3))
-    ks_strides = (ks.stride(0), ks.stride(1), ks.stride(2))
     v_strides = (v.stride(0), v.stride(1), v.stride(2), v.stride(3))
-    # vs_strides = (vs.stride(0), vs.stride(1), vs.stride(2))
     o_strides = (o.stride(0), o.stride(1), o.stride(2), o.stride(3))
 
     # Get closest power of 2 over or equal to 32.
@@ -763,7 +760,7 @@ def flash_QK_rowwise_V_tensorwise(
 
     attn_fwd[grid](
         q, k, v, qs, ks, vs, None, sm_scale, M, o,
-        *q_strides, *qs_strides, *k_strides, *ks_strides, *v_strides, *o_strides, *bias_strides, *alibi_strides,
+        *q_strides, *k_strides, *v_strides, *o_strides, *bias_strides, *alibi_strides,
         None, None,
         BLOCK_M=BLOCK_M,
         PRE_LOAD_V=PRE_LOAD_V,
@@ -792,20 +789,56 @@ def flash_QK_rowwise_V_tensorwise(
 # @flash.register_fake
 # def _(q, k, v):
 #     return torch.empty_like(q, dtype=v.dtype)
-            
 
-# if __name__ == "__main__":
+def main(length):
+    from fms.triton.quantization import triton_quantize_fp8_row, get_fp8_constants, quantize_fp8_tensorwise_pt
 
-#     b, nh, s, hd = 1, 32, 128, 128
 
-#     q = torch.randn(b, nh, s, hd, dtype=torch.float16, device='cuda')
-#     k = torch.randn(b, nh, s, hd, dtype=torch.float16, device='cuda')
-#     v = torch.randn(b, nh, s, hd, dtype=torch.float16, device='cuda')
+    SHAPE = [1, 32, length, 128]
 
-#     sm_scale = q.shape[-1] ** -0.5
+    queries = torch.randn(SHAPE, dtype=torch.float16, device="cuda")
+    keys_e = torch.randn(SHAPE, dtype=torch.float16, device="cuda")
+    values_e = torch.randn(SHAPE, dtype=torch.float16, device="cuda")
 
-#     # @torch.compile(fullgraph=True)
-#     # def f(q, k, v):
-#     #     return flash(q, k, v)
+    head_dim = queries.shape[-1]
+    ori_dtype = queries.dtype
+
+    # q_ht = hadamard_transform_ref(queries, scale=1.0 / (head_dim ** 0.5))
+    # k_ht = hadamard_transform_ref(keys_e, scale=1.0 / (head_dim ** 0.5))
+
+    q_ht = queries
+    k_ht = keys_e
     
-#     o = f(q, k, v)
+    q_fp8, scale_q_tensor = quantize_fp8_tensorwise_pt(q_ht)
+    k_fp8, scale_k_tensor = quantize_fp8_tensorwise_pt(k_ht)
+    v_fp8, scale_v_tensor = quantize_fp8_tensorwise_pt(values_e)
+
+    # q_fp8 = convert_fp8_type(q_fp8, tl_dtype)
+    # k_fp8 = convert_fp8_type(k_fp8, tl_dtype)
+
+    q_dequant =  (q_fp8.to(torch.float32) * scale_q_tensor).to(ori_dtype)
+    k_dequant =  (k_fp8.to(torch.float32) * scale_k_tensor).to(ori_dtype)
+    v_dequant =  (v_fp8.to(torch.float32) * scale_v_tensor).to(ori_dtype)
+
+    scale_q_fake = torch.ones_like(scale_q_tensor)
+    scale_k_fake = torch.ones_like(scale_k_tensor)
+    scale_v_fake = torch.ones_like(scale_v_tensor)
+
+    # breakpoint()
+    
+    attn_ref = flash_QKV_tensorwise(q_dequant, k_dequant, v_dequant, scale_q_fake, scale_k_fake, scale_v_fake, ori_dtype)
+    attn = flash_QKV_tensorwise(q_fp8, k_fp8, v_fp8, scale_q_tensor, scale_k_tensor, scale_v_tensor, ori_dtype)
+
+    print("---")
+    print("attn", attn[0][0][0])
+    print("ref", attn_ref[0][0][0])
+    print("----")
+    # print("attn"m torch.isnan(attn).any())
+    # print(attn[0][0][1])
+    # print(attn_ref[0][0][1])
+    # print("----")
+    # print(attn[0][0][2])
+    # print(attn_ref[0][0][2])
+
+if __name__ == "__main__":
+    main(128)

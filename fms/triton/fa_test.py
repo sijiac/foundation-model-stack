@@ -14,7 +14,7 @@ from fms.modules.positions import PositionEncoder
 from fms.modules.tp import TPModule
 from fms.triton.quantization import triton_quantize_fp8_row, get_fp8_constants, quantize_fp8_tensorwise_pt
 from fms.triton.hadmard_transform import hadamard_transform_ref
-from fms.triton.triton_flash_attention import flash as flash_amd_triton_kernel
+from fms.triton.triton_flash_attention import flash_QK_rowwise_V_tensorwise as flash_amd_triton_kernel
 from fms.triton.triton_linear import TritonLinear
 from torch import nn, Tensor
 from torch.distributed.distributed_c10d import ProcessGroup

@@ -13,8 +13,8 @@ from fms.distributed.tensorparallel import (
 from fms.modules.tp import TPModule
 from fms.triton.triton_linear import TritonLinear
 
-USE_CUDA = False
-USE_TRITON = True
+USE_CUDA = True
+USE_TRITON = False
 
 class MLPClassificationHead(nn.Module):
     """

@@ -31,6 +31,8 @@ class FMSEvalHarnessLM(LM):
         self.model = generic_object
         self.model.config = generic_object  # type: ignore
         self.model.config._name_or_path = "FMSEvalHarnessLM"  # type: ignore
+        # self.max_context_length = 8192
+
 
     def loglikelihood_one(self, context: str, continuation: str) -> Tuple[float, bool]:
         context_ids = self.tokenizer.convert_tokens_to_ids(
@@ -49,7 +51,7 @@ class FMSEvalHarnessLM(LM):
         logits = F.log_softmax(self.wrapped_model(input_ids)[0], -1)
         continuation_probs = logits[len(context_ids) - 1 :]
         loglikelihood = torch.gather(
-            continuation_probs, 1, torch.tensor(continuation_ids).unsqueeze(1)
+            continuation_probs, 1, torch.tensor(continuation_ids, device=self.device).unsqueeze(1)
         ).squeeze()
         predicted = torch.argmax(continuation_probs, -1).tolist()
         greedy = predicted == continuation_ids

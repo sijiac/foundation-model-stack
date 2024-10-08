@@ -15,8 +15,8 @@ from fms.distributed.tensorparallel import (
 from fms.modules.tp import TPModule
 from fms.triton.triton_linear import TritonLinear
 
-USE_CUDA = False
-USE_TRITON = True
+USE_CUDA = True
+USE_TRITON = False
 
 class WordEmbedding(nn.Module):
     """
@@ -118,7 +118,7 @@ class WordEmbedding(nn.Module):
                 ), f"Error: you have requested a negative vocab index: {inp.min().item()}"
                 assert (
                     inp.max().item() < self.vocab_size
-                ), f"Error: you have requested an out of vocab index: {inp.max().item()}"
+                ), f"Error: you have requested an out of vocab index: {inp.max().item()}, {self.vocab_size}"
             out = self.emb(inp)
             if self.abs_pos:
                 pos = self.pos_id[:, : inp.size(1)]
