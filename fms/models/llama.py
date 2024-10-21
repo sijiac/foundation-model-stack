@@ -17,9 +17,9 @@ from fms.distributed.strategy import (
     TensorParallelStrategy,
     UniformModelParallelStrategy,
 )
-from fms.modules.attention import MultiHeadAttention
+from fms.modules.attention import MultiHeadAttention, set_fp8_attention, get_fp8_attention
 from fms.modules.embedding import WordEmbedding
-from fms.modules.feedforward import GatedLinearUnit
+from fms.modules.feedforward import GatedLinearUnit, get_fp8_ffn, set_fp8_ffn
 from fms.modules.layernorm import LayerNormParameterized
 from fms.modules.positions import RotaryEmbedding
 from fms.utils import serialization
@@ -322,16 +322,36 @@ class LLaMA(nn.Module):
         # this is the output cache for all the decoder layers
         present_key_value_states = []
 
+        num_of_layers = len(self.layers)
+
         for i, layer in enumerate(self.layers):
-            output = layer(
-                x=x_in,
-                mask=mask,
-                position_ids=position_ids,
-                past_key_value_state=past_key_value_states[i],
-                use_cache=use_cache,
-                is_causal_mask=is_causal_mask,
-                attn_algorithm=attn_algorithm,
-            )
+            if i == num_of_layers - 1:
+                ori_value = get_fp8_attention()
+                set_fp8_attention(0)
+
+                ori_ffn = get_fp8_ffn()
+                set_fp8_ffn(0)
+                output = layer(
+                    x=x_in,
+                    mask=mask,
+                    position_ids=position_ids,
+                    past_key_value_state=past_key_value_states[i],
+                    use_cache=use_cache,
+                    is_causal_mask=is_causal_mask,
+                    attn_algorithm=attn_algorithm,
+                )
+                set_fp8_attention(ori_value)
+                set_fp8_ffn(ori_ffn)
+            else:
+                output = layer(
+                    x=x_in,
+                    mask=mask,
+                    position_ids=position_ids,
+                    past_key_value_state=past_key_value_states[i],
+                    use_cache=use_cache,
+                    is_causal_mask=is_causal_mask,
+                    attn_algorithm=attn_algorithm,
+                )
 
             if use_cache:
                 x_in, present_key_value_state = output

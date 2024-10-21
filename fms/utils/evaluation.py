@@ -38,6 +38,7 @@ class FMSEvalHarnessLM(LM):
         context_ids = self.tokenizer.convert_tokens_to_ids(
             self.tokenizer.tokenize(context)
         )
+        breakpoint()
         if not len(context_ids):
             context_ids = [self.tokenizer.bos_token_id]
 

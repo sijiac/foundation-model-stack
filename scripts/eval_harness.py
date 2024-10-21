@@ -10,6 +10,7 @@ from torch import distributed as dist
 from fms.models import get_model
 from fms.utils import evaluation, tokenizers
 from fms.utils.eval_perplexity import evaluate_perplexity
+from fms.modules.attention import MAX_PERCENT_Q, MAX_PERCENT_K
 
 
 """
@@ -100,7 +101,7 @@ if args.device_type == "cuda":
 else:
     device = torch.device(args.device_type)
 
-torch.set_default_dtype(torch.half)
+torch.set_default_dtype(torch.bfloat16)
 
 # requires setting environment variable: `CUBLAS_WORKSPACE_CONFIG=:4096:8`
 if args.deterministic:
@@ -143,10 +144,14 @@ if args.compile:
 
 
 
-if args.tasks.split(",") == "perplexity":
+if args.tasks.split(",")[0] == "perplexity":
     evaluate_perplexity(model, tokenizer)
+
+    print(f"{MAX_PERCENT_Q=}")
+
+    print(f"{MAX_PERCENT_K=}")
 else:
-    args.tasks = ",".join(lm_eval.tasks.TASKS.keys())
+    # args.tasks = ",".join(lm_eval.tasks.TASKS.keys())
     lm_obj = evaluation.FMSEvalHarnessLM(model=model, tokenizer=tokenizer, device=device)
     # lm_ojb_hf = evaluation_hf.HFLM(pretrained=model, tokenizer=tokenizer, device=device, max_length=8192)
 

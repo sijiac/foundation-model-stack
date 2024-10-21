@@ -13,10 +13,22 @@ from fms.distributed.tensorparallel import (
     reduce_from_tensor_model_parallel_region,
 )
 from fms.modules.tp import TPModule
-from fms.triton.triton_linear import TritonLinear
+from fms.triton.triton_linear import TritonLinear, TritonFP8Linear
+import os
 
-USE_CUDA = True
 USE_TRITON = False
+
+USE_FP8_FFN = bool(int(os.getenv('USE_FP8_FFN', 0)))
+USE_CUDA = not (USE_TRITON or USE_FP8_FFN)
+
+print(f"{USE_FP8_FFN=}")
+
+def set_fp8_ffn(value):
+    global USE_FP8_FFN
+    USE_FP8_FFN = value
+
+def get_fp8_ffn():
+    return USE_FP8_FFN
 
 class FeedForwardBlock(nn.Module):
     """
@@ -55,6 +67,9 @@ class FeedForwardBlock(nn.Module):
                 (self.hidden_dim + multiple_of - 1) // multiple_of
             )
         
+        if USE_FP8_FFN:
+            self.w1 = TritonFP8Linear(emb_dim, self.hidden_dim, bias=use_bias)
+        
         if USE_CUDA:
             self.w1 = nn.Linear(emb_dim, self.hidden_dim, bias=use_bias)
         
@@ -65,6 +80,9 @@ class FeedForwardBlock(nn.Module):
         self.p_dropout = p_dropout
         if p_dropout:
             self.d = nn.Dropout(p_dropout)
+
+        if USE_FP8_FFN:
+            self.w2 = TritonFP8Linear(self.hidden_dim, emb_dim, bias=use_bias)
 
         if USE_CUDA:
             self.w2 = nn.Linear(self.hidden_dim, emb_dim, bias=use_bias)
@@ -225,6 +243,8 @@ class GatedLinearUnit(nn.Module):
             self.wg1_fused = nn.Linear(emb_dim, 2 * self.hidden_dim, bias=use_bias)
         if USE_TRITON:
             self.wg1_fused = TritonLinear(emb_dim, 2 * self.hidden_dim, bias=use_bias)
+        if USE_FP8_FFN:
+            self.wg1_fused = TritonFP8Linear(emb_dim, 2 * self.hidden_dim, bias=use_bias)
         self.a = activation_fn
         self.p_dropout = p_dropout
         if p_dropout:
@@ -233,6 +253,8 @@ class GatedLinearUnit(nn.Module):
             self.w2 = nn.Linear(self.hidden_dim, emb_dim, bias=use_bias)
         if USE_TRITON:
             self.w2 = TritonLinear(self.hidden_dim, emb_dim, bias=use_bias)
+        if USE_FP8_FFN:
+            self.w2 = TritonFP8Linear(self.hidden_dim, emb_dim, bias=use_bias)
         self.use_bias = use_bias
         self.width = emb_dim
         self.grow_factor = hidden_grow_factor

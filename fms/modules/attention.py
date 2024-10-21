@@ -1,9 +1,12 @@
 import abc
 import functools
+import os
+from math import e
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.distributed
+import triton  # @manual
 
 from fms import distributed
 from fms.distributed.tensorparallel import (
@@ -12,30 +15,22 @@ from fms.distributed.tensorparallel import (
 )
 from fms.modules.positions import PositionEncoder
 from fms.modules.tp import TPModule
-from fms.triton.quantization import triton_quantize_fp8_row, get_fp8_constants, quantize_fp8_tensorwise_pt
-from fms.triton.hadmard_transform import hadamard_transform_ref
-from fms.triton.triton_flash_attention import flash_QK_rowwise_V_tensorwise
-from fms.triton.triton_flash_attention_tensorwise import flash_QKV_tensorwise
+from fms.triton.triton_fp8_attention.envs import (  # @manual
+    get_fp8_attention,
+    set_fp8_attention,
+    USE_FP8_ATTENTION,
+)
+from fms.triton.triton_fp8_attention.interface import fp8_attention
 from fms.triton.triton_linear import TritonLinear
 from torch import nn, Tensor
 from torch.distributed.distributed_c10d import ProcessGroup
 from torch.nn import functional as F
 from triton.runtime.jit import reinterpret as tl_reinterpret, TensorWrapper  # @manual
-import triton  # @manual
-import os
+from fms.triton.triton_fp8_attention.utils import MAX_PERCENT_Q, MAX_PERCENT_K, MAX_PERCENT_V
 
 USE_CUDA = True
 USE_TRITON = False
 
-USE_FP8_ATTENTION = int(os.getenv('USE_FP8_ATTENTION', '0'))
-# 0 = no fp8 quantization
-# 1 = flash_QK_rowwise_V_tensorwise
-# 2 = flash_QKV_tensorwise
-# 3 = QKV direct cast
-USE_HDT = bool(os.getenv('USE_HDT', '0') == '1')
-
-print("[FP8 ATTENTION] USE_FP8_ATTENTION = ", USE_FP8_ATTENTION)
-print("[FP8 ATTENTION] USE_HDT = ", USE_HDT)
 
 # flex_attention = torch.compile(flex_attention, dynamic=False)
 class QKV(nn.Module, metaclass=abc.ABCMeta):
@@ -452,57 +447,7 @@ class MultiHeadAttention(nn.Module):
                 is_causal=is_causal_mask,
             )
         else:
-            head_dim = queries.shape[-1]
-            ori_dtype = queries.dtype
-            if USE_HDT:
-                q = hadamard_transform_ref(queries, scale=1.0 / (head_dim ** 0.5))
-                k = hadamard_transform_ref(keys_e, scale=1.0 / (head_dim ** 0.5))
-                v = values_e
-            else:
-                q = queries
-                k = keys_e
-                v = values_e
-            
-            # 0 = no fp8 quantization
-            # 1 = flash_QK_rowwise_V_tensorwise
-            # 2 = flash_QKV_tensorwise
-            # 3 = QKV direct cast
-            if USE_FP8_ATTENTION == 1:
-                q_fp8, scale_q = triton_quantize_fp8_row(q)
-                k_fp8, scale_k = triton_quantize_fp8_row(k)
-                v_fp8, scale_v_tensor = quantize_fp8_tensorwise_pt(v)
-                attn = flash_QK_rowwise_V_tensorwise(q_fp8, k_fp8, v_fp8, scale_q, scale_k, scale_v_tensor, output_dtype=ori_dtype)
-            elif USE_FP8_ATTENTION == 2:
-                q_fp8, scale_q_tensor = quantize_fp8_tensorwise_pt(q)
-                k_fp8, scale_k_tensor = quantize_fp8_tensorwise_pt(k)
-                v_fp8, scale_v_tensor = quantize_fp8_tensorwise_pt(v)
-                attn = flash_QKV_tensorwise(q_fp8, k_fp8, v_fp8, scale_q_tensor, scale_k_tensor, scale_v_tensor, output_dtype=ori_dtype)
-            elif USE_FP8_ATTENTION == 3:
-                ptype, _, _, _ = get_fp8_constants()
-                q_fp8 = q.to(ptype)
-                k_fp8 = k.to(ptype)
-                v_fp8 = v.to(ptype)
-                qs = torch.tensor([1.0], dtype=torch.float32, device=q.device)
-                attn = flash_QKV_tensorwise(q_fp8, k_fp8, v_fp8, qs, qs, qs, output_dtype=ori_dtype)
-            
-
-            # q_ht = hadamard_transform_ref(queries, scale=1.0 / (head_dim ** 0.5))
-            # k_ht = hadamard_transform_ref(keys_e, scale=1.0 / (head_dim ** 0.5))
-            
-            # q_fp8, scale_q = triton_quantize_fp8_row(q_ht)
-            # k_fp8, scale_k = triton_quantize_fp8_row(k_ht)
-            # v_fp8, scale_v = triton_quantize_fp8_row(values_e)
-            # scale_v_fake = torch.ones_like(scale_v_tensor)
-
-            # q_dequant =  (q_fp8.to(torch.float32) * scale_q.unsqueeze(-1)).to(ori_dtype)
-            # k_dequant =  (k_fp8.to(torch.float32) * scale_k.unsqueeze(-1)).to(ori_dtype)
-            # v_dequant =  (v_fp8.to(torch.float32) * scale_v_tensor).to(ori_dtype)
-
-            # scale_q_fake = torch.ones_like(scale_q)
-            # scale_k_fake = torch.ones_like(scale_k)
-
-            # attn = flash_amd_triton_kernel(q_fp8, k_fp8, v_fp8, scale_q, scale_k, scale_v_fake, output_dtype=ori_dtype)
-            
+            attn = fp8_attention(queries, keys_e, values_e)
 
         if attn_algorithm:
             torch.backends.cuda.enable_flash_sdp(self.previous_flash)

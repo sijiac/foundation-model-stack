@@ -4,7 +4,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-
+from fms.triton.triton_fp8_attention.quantization import triton_quantize_fp8_row
+from .fp8_gemm import matmul_fp8_row
+from .triton_fp8_attention.utils import collect_abs_percentiles, MAX_PERCENT_Q, compute_quantile_with_numpy
 
 @triton.jit()
 def column_major(pid,
@@ -152,7 +154,7 @@ def matmul(a, b):
     
     grid = (total_programs_mn, total_programs_k)
     
-    c = torch.zeros((m, n), device=a.device, dtype=torch.float16)
+    c = torch.zeros((m, n), device=a.device, dtype=a.dtype)
     k = gemm_split_k_kernel[grid](a, b, c,
                             a.stride(0), a.stride(1),
                             b.stride(0), b.stride(1),
@@ -209,7 +211,7 @@ class TritonLinear(nn.Module):
 
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=torch.float16, device='cuda'))
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=torch.bfloat16, device='cuda'))
 
         # Granite
         # if bias:
@@ -220,7 +222,7 @@ class TritonLinear(nn.Module):
         ishape= list(input.shape)
         if len(ishape) == 3:
             input = input.view(-1,ishape[-1])
-
+        
         y = matmul(input, self.weight.T)
 
         # Granite
@@ -232,14 +234,50 @@ class TritonLinear(nn.Module):
 
         return y
     
-       
+
+class TritonFP8Linear(nn.Module):
+    def __init__(self, in_features, out_features, bias):
+        super(TritonFP8Linear, self).__init__()
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=torch.bfloat16, device='cuda'))
+
+        self.scale_ub = torch.tensor([1200.0], dtype=torch.float32, device='cuda')
+        self.scale_ub = None
+
+        self.wq = None
+        self.scale = None
+
+        # Granite
+        # if bias:
+        # self.bias = nn.Parameter(torch.empty(out_features, dtype=torch.float16, device='cuda'))
+
+
+    def forward(self, input):
+        if self.wq is None:
+            self.wq, self.scale = triton_quantize_fp8_row(self.weight, self.scale_ub)
+
+        ishape= list(input.shape)
+        if len(ishape) == 3:
+            input = input.view(-1,ishape[-1])
+        
+        xq, xs = triton_quantize_fp8_row(input, self.scale_ub)
+
+        y = matmul_fp8_row(xq, self.wq, xs, self.scale, tma_persistent=False)
+
+        if len(ishape) == 3:            
+            y = y.view(ishape[0],ishape[1],-1)
+
+        return y
+
 
 if __name__ == '__main__':
 
     m, k, n = 512, 512, 512
     
-    a = torch.randn(m, k, dtype=torch.float16, device='cuda')
-    b = torch.randn(k, n, dtype=torch.float16, device='cuda')
+    a = torch.randn(m, k, dtype=torch.bfloat16, device='cuda')
+    b = torch.randn(k, n, dtype=torch.bfloat16, device='cuda')
 
     @torch.compile(fullgraph=True)
     def f(a, b):
@@ -251,5 +289,3 @@ if __name__ == '__main__':
 
     print(c)
     print(c2)
-
-

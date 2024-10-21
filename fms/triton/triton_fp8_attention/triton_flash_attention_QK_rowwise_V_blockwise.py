@@ -166,7 +166,7 @@ def load_scale_fn(block_ptr, first, pad):
 def _attn_fwd_inner(
     acc, l_i, m_i, q, qs,
     K_block_ptr, Ks_block_ptr, V_block_ptr,
-    vs,
+    Vs_block_ptr,
     start_m,
     actual_seqlen_k,
     actual_seqlen_q,
@@ -200,6 +200,10 @@ def _attn_fwd_inner(
         k = load_fn(K_block_ptr, PADDED_HEAD, MASK_STEPS and (n_extra_tokens != 0), "zero")
         ks = load_scale_fn(Ks_block_ptr, MASK_STEPS and (n_extra_tokens != 0), "zero")
         ks = tl.where(ks < 1e-6, 1.0, ks)
+        vs = tl.load(Vs_block_ptr)
+
+        # tl.device_print("vs", vs, start_n)
+
         if PRE_LOAD_V:
             v = load_fn(V_block_ptr, MASK_STEPS and (n_extra_tokens != 0), PADDED_HEAD, "zero")
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -258,11 +262,11 @@ def _attn_fwd_inner(
         qk = qk - m_ij[:, None]
         p = tl.math.exp2(qk)
 
-        # p_max = tl.max(tl.abs(p))
-        # p_scale = p_max / MAX_FP8
-        # p_invs_scale = 1.0 / p_scale
-        # # p_fp8 = (p * p_invs_scale)
-        p_fp8 = p
+        p_max = tl.max(tl.abs(p))
+        p_scale = p_max / MAX_FP8
+        p_invs_scale = 1.0 / p_scale
+        p_fp8 = (p * p_invs_scale)
+        # p_fp8 = p
 
 
         # CAVEAT: Must update l_ij before applying dropout
@@ -284,11 +288,13 @@ def _attn_fwd_inner(
         l_i = l_i * alpha + l_ij
         # update m_i and l_i
         m_i = m_ij
-        acc += tl.dot(p_fp8.to(V_block_ptr.type.element_ty), v) * vs
-        # acc += tl.dot(p_fp8.to(V_block_ptr.type.element_ty), v) * p_scale * vs
+        # acc += tl.dot(p_fp8.to(V_block_ptr.type.element_ty), v) * vs
+        acc += tl.dot(p_fp8.to(V_block_ptr.type.element_ty), v) * p_scale * vs
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
         Ks_block_ptr = tl.advance(Ks_block_ptr, (BLOCK_N,))
+        # vs block ptr movement
+        Vs_block_ptr = tl.advance(Vs_block_ptr, (1,))
         if bias_ptr is not None:
             bias_ptr = tl.advance(bias_ptr, (0, BLOCK_N))
         if RETURN_ENCODED_SOFTMAX:
@@ -304,7 +310,7 @@ def attn_fwd(
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_ksz, stride_ksh, stride_ksn,
     stride_vz, stride_vh, stride_vk, stride_vn,
-    # stride_vsz, stride_vsh, stride_vsk,
+    stride_vsz, stride_vsh, stride_vsk,
     stride_oz, stride_oh, stride_om, stride_on,
     stride_bz, stride_bh, stride_bm, stride_bn,
     stride_az, stride_ah,
@@ -449,7 +455,15 @@ def attn_fwd(
         block_shape=(BLOCK_N, BLOCK_DMODEL),
         order=v_order,
     )
-    vs = tl.load(Vs)
+    vs_offset = off_z * stride_vsz +  off_h_k * stride_vsh
+    Vs_block_ptr = tl.make_block_ptr(
+        base=Vs + vs_offset,
+        shape=(n_blocks,),
+        strides=(stride_vsk,),
+        offsets=(0,),
+        block_shape=(1,),
+        order=(0,)
+    )
     if BIAS_TYPE != 0:
         b_offset = off_h_q * stride_bh # Note: this might get large enough to overflow on some configs
         bias_ptr = tl.make_block_ptr(
@@ -529,7 +543,7 @@ def attn_fwd(
     if n_full_blocks > 0:
         block_max = (n_blocks - masked_blocks) * BLOCK_N
         acc, l_i, m_i = _attn_fwd_inner(
-            acc, l_i, m_i, q, qs, K_block_ptr, Ks_block_ptr, V_block_ptr, vs,
+            acc, l_i, m_i, q, qs, K_block_ptr, Ks_block_ptr, V_block_ptr, Vs_block_ptr,
             start_m, seqlen_k, seqlen_q,
             dropout_p, philox_seed, batch_philox_offset, encoded_softmax_block_ptr,
             # _, _, offs_n_causal, masked_blocks, n_extra_tokens, _
@@ -558,7 +572,7 @@ def attn_fwd(
             encoded_softmax_block_ptr = tl.advance(encoded_softmax_block_ptr,
                                                    (0, n_full_blocks))
         acc, l_i, m_i = _attn_fwd_inner(
-            acc, l_i, m_i, q, qs, K_block_ptr, Ks_block_ptr, V_block_ptr, vs,
+            acc, l_i, m_i, q, qs, K_block_ptr, Ks_block_ptr, V_block_ptr, Vs_block_ptr,
             start_m, seqlen_k, seqlen_q,
             dropout_p, philox_seed, batch_philox_offset, encoded_softmax_block_ptr,
             block_min, block_max, offs_n_causal, masked_blocks, n_extra_tokens, bias_ptr, alibi_slope,
@@ -699,7 +713,7 @@ def attn_fwd(
 #     return o
 
 
-def flash_QK_rowwise_V_tensorwise(
+def flash_QK_rowwise_V_blockwise(
     q: torch.Tensor, 
     k: torch.Tensor, 
     v: torch.Tensor,
@@ -722,7 +736,7 @@ def flash_QK_rowwise_V_tensorwise(
     k_strides = (k.stride(0), k.stride(1), k.stride(2), k.stride(3))
     ks_strides = (ks.stride(0), ks.stride(1), ks.stride(2))
     v_strides = (v.stride(0), v.stride(1), v.stride(2), v.stride(3))
-    # vs_strides = (vs.stride(0), vs.stride(1), vs.stride(2))
+    vs_strides = (vs.stride(0), vs.stride(1), vs.stride(2))
     o_strides = (o.stride(0), o.stride(1), o.stride(2), o.stride(3))
 
     # Get closest power of 2 over or equal to 32.
@@ -763,7 +777,7 @@ def flash_QK_rowwise_V_tensorwise(
 
     attn_fwd[grid](
         q, k, v, qs, ks, vs, None, sm_scale, M, o,
-        *q_strides, *qs_strides, *k_strides, *ks_strides, *v_strides, *o_strides, *bias_strides, *alibi_strides,
+        *q_strides, *qs_strides, *k_strides, *ks_strides, *v_strides, *vs_strides, *o_strides, *bias_strides, *alibi_strides,
         None, None,
         BLOCK_M=BLOCK_M,
         PRE_LOAD_V=PRE_LOAD_V,
@@ -784,7 +798,7 @@ def flash_QK_rowwise_V_tensorwise(
         USE_ALIBI=0,
         ENABLE_DROPOUT=False,
         RETURN_ENCODED_SOFTMAX=False,
-        BATCH_SIZE= q.shape[0],
+        BATCH_SIZE=q.shape[0],
         MAX_FP8=max_fp8,
     )
     return o
